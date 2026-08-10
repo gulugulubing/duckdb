@@ -30,4 +30,14 @@ public:
 	                             bool is_root) override;
 };
 
+//! Rewrites top-level filter equality between a row constructor and a folded row constant
+//! (e.g. (id, b) = (42, 2)) into scalar equalities.
+class ConstantRowComparisonSimplificationRule : public Rule {
+public:
+	explicit ConstantRowComparisonSimplificationRule(ExpressionRewriter &rewriter);
+
+	unique_ptr<Expression> Apply(LogicalOperator &op, vector<reference<Expression>> &bindings, bool &changes_made,
+	                             bool is_root) override;
+};
+
 } // namespace duckdb
