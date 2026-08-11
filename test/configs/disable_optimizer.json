@@ -17,7 +17,8 @@
         "test/sql/types/geo/geometry_parquet_pushdown.test",
         "test/optimizer/statistics/statistics_filter_pruning.test",
         "test/sql/copy/parquet/parquet_expression_filter_pruning.test",
-        "test/sql/copy/parquet/parquet_virtual_file_row_group_number.test"
+        "test/sql/copy/parquet/parquet_virtual_file_row_group_number.test",
+        "test/sql/filter/test_tuple_comparison_pushdown.test"
       ]
     },
     {
@@ -57,7 +58,6 @@
         "test/optimizer/join_dependent_filter.test",
         "test/optimizer/joins/no_duplicate_elimination_join.test",
         "test/optimizer/joins/tpcds_nofail.test",
-        "test/sql/filter/test_tuple_comparison_pushdown.test",
         "test/sql/limit/test_limit0.test",
         "test/sql/optimizer/plan/test_filter_pushdown_large.test",
         "test/optimizer/joins/denominator_cardinality_estimation.test"

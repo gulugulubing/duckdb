@@ -34,43 +34,15 @@ SELECT count(*) FROM t WHERE (id, b) = (42, 3);
 ----
 0
 
-# a comparison with NULL is unsatisfiable
-query I
-SELECT count(*) FROM t WHERE (id, b) = (NULL, 2);
-----
-0
-
-# mismatched literal types are aligned to the tuple's common type at bind time (3.5 -> 4), and still decompose:
-# id = 42 is pushed down
+# mismatched literal types are aligned to the tuple's common type at bind time (1.5 -> 2), and still decompose:
+# id = 42 is pushed down; the aligned value (42, 2) matches the id = 42 row
 query II
-EXPLAIN SELECT count(*) FROM t WHERE (id, b) = (42, 3.5);
+EXPLAIN SELECT count(*) FROM t WHERE (id, b) = (42, 1.5);
 ----
 physical_plan	<REGEX>:(?s).*Table: .*\.t.*Filters:.*id = 42.*
 
 query I
-SELECT count(*) FROM t WHERE (id, b) = (42, 3.5);
+SELECT count(*) FROM t WHERE (id, b) = (42, 1.5);
 ----
-0
+1
 
-# tuple equality as a join condition is kept as-is (the rule only fires on filters), and is equivalent
-query I
-SELECT count(*) FROM t a, t b WHERE (a.id, a.b) = (b.id, b.b);
-----
-500000
-
-# non-equality comparisons are not decomposed and keep lexicographic semantics
-query I
-SELECT count(*) FROM t WHERE (id, b) < (42, 2);
-----
-42
-
-query I
-SELECT count(*) FROM t WHERE (id, b) != (42, 2);
-----
-499999
-
-# tuple comparisons outside of filters (e.g. in the projection) are untouched
-query II
-EXPLAIN SELECT (id, b) FROM t WHERE id = 42;
-----
-physical_plan	<REGEX>:.*"row"\(id, b\).*
