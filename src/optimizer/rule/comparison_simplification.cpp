@@ -164,7 +164,10 @@ static bool ExtractRowComparisonSide(Expression &expr, LogicalType &type, vector
 	if (type.id() != LogicalTypeId::TUPLE && type.id() != LogicalTypeId::STRUCT) {
 		return false;
 	}
-	children = std::move(row->GetChildrenMutable());
+	// copy the children: Apply may still reject the rewrite, and must leave the plan untouched when it does
+	for (auto &child : row->GetChildrenMutable()) {
+		children.push_back(child->Copy());
+	}
 	is_constant = false;
 	return true;
 }
@@ -216,9 +219,11 @@ ConstantRowComparisonSimplificationRule::ConstantRowComparisonSimplificationRule
     : Rule(rewriter) {
 	auto comparison = make_uniq<ComparisonExpressionMatcher>();
 	comparison->expr_type = make_uniq<SpecificExpressionTypeMatcher>(ExpressionType::COMPARE_EQUAL);
-	// one side can be a folded TUPLE/STRUCT constant, so match any children and validate in Apply
-	comparison->matchers.push_back(make_uniq<ExpressionMatcher>());
-	comparison->matchers.push_back(make_uniq<ExpressionMatcher>());
+	// one side is a folded TUPLE/STRUCT constant, the other a row constructor (possibly cast-wrapped);
+	// row-vs-row comparisons are handled by RowComparisonSimplificationRule
+	comparison->matchers.push_back(make_uniq<ExpressionMatcher>(ExpressionClass::BOUND_CONSTANT));
+	comparison->matchers.push_back(make_uniq<ExpressionMatcher>(ExpressionClass::BOUND_FUNCTION));
+	comparison->policy = SetMatcher::Policy::SOME;
 	root = std::move(comparison);
 }
 
@@ -243,10 +248,6 @@ unique_ptr<Expression> ConstantRowComparisonSimplificationRule::Apply(LogicalOpe
 	if (!ExtractRowComparisonSide(right, right_type, right_children, right_is_constant)) {
 		return nullptr;
 	}
-	if (left_is_constant == right_is_constant) {
-		// both sides are row constructor functions: handled by RowComparisonSimplificationRule
-		return nullptr;
-	}
 	// both sides are aligned to a common type at bind time
 	if (left_type != right_type || left_children.empty() || left_children.size() != right_children.size()) {
 		return nullptr;
@@ -264,6 +265,7 @@ unique_ptr<Expression> ConstantRowComparisonSimplificationRule::Apply(LogicalOpe
 	}
 	auto result = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
 	for (idx_t child_idx = 0; child_idx < left_children.size(); child_idx++) {
+		// the unwrapped children carry the original column types - compare them in the aligned field type
 		auto left_child = BoundCastExpression::AddCastToType(GetContext(), std::move(left_children[child_idx]),
 		                                                     child_types[child_idx].second);
 		auto right_child = BoundCastExpression::AddCastToType(GetContext(), std::move(right_children[child_idx]),
