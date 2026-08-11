@@ -57,6 +57,7 @@
         "test/optimizer/join_dependent_filter.test",
         "test/optimizer/joins/no_duplicate_elimination_join.test",
         "test/optimizer/joins/tpcds_nofail.test",
+        "test/sql/filter/test_tuple_comparison_pushdown.test",
         "test/sql/limit/test_limit0.test",
         "test/sql/optimizer/plan/test_filter_pushdown_large.test",
         "test/optimizer/joins/denominator_cardinality_estimation.test"
