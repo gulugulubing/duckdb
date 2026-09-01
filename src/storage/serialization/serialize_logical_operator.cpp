@@ -864,6 +864,7 @@ void LogicalSetOperation::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<idx_t>(201, "column_count", column_count);
 	serializer.WritePropertyWithDefault<bool>(202, "setop_all", setop_all, true);
 	serializer.WritePropertyWithDefault<bool>(203, "allow_out_of_order", allow_out_of_order, true);
+	serializer.WritePropertyWithDefault<vector<pair<idx_t, idx_t>>>(204, "sink_work_dependencies", sink_work_dependencies, {});
 }
 
 unique_ptr<LogicalOperator> LogicalSetOperation::Deserialize(Deserializer &deserializer) {
@@ -872,6 +873,7 @@ unique_ptr<LogicalOperator> LogicalSetOperation::Deserialize(Deserializer &deser
 	auto setop_all = deserializer.ReadPropertyWithExplicitDefault<bool>(202, "setop_all", true);
 	auto allow_out_of_order = deserializer.ReadPropertyWithExplicitDefault<bool>(203, "allow_out_of_order", true);
 	auto result = duckdb::unique_ptr<LogicalSetOperation>(new LogicalSetOperation(table_index, column_count, deserializer.Get<LogicalOperatorType>(), setop_all, allow_out_of_order));
+	deserializer.ReadPropertyWithExplicitDefault<vector<pair<idx_t, idx_t>>>(204, "sink_work_dependencies", result->sink_work_dependencies, {});
 	return std::move(result);
 }
 

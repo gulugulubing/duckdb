@@ -9,9 +9,10 @@ namespace duckdb {
 
 PhysicalUnion::PhysicalUnion(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                              const ArenaLinkedList<reference<PhysicalOperator>> &children_p,
-                             idx_t estimated_cardinality, bool allow_out_of_order)
+                             idx_t estimated_cardinality, bool allow_out_of_order,
+                             vector<pair<idx_t, idx_t>> sink_work_dependencies_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::UNION, std::move(types_p), estimated_cardinality),
-      allow_out_of_order(allow_out_of_order) {
+      allow_out_of_order(allow_out_of_order), sink_work_dependencies(std::move(sink_work_dependencies_p)) {
 	for (auto &child : children_p) {
 		children.push_back(child);
 	}
@@ -65,8 +66,20 @@ void PhysicalUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipelin
 		auto &union_pipeline = meta_pipeline.CreateUnionPipeline(current, order_matters);
 		union_pipelines.push_back(union_pipeline);
 	}
+	// collect the sink work (the child meta pipelines) created by building each child
+	auto collect_sink_work = [&meta_pipeline](idx_t start) {
+		vector<shared_ptr<Pipeline>> result;
+		auto &meta_children = meta_pipeline.GetChildren();
+		for (idx_t k = start; k < meta_children.size(); k++) {
+			result.push_back(meta_children[k]->GetBasePipeline());
+		}
+		return result;
+	};
 	// continue with the current pipeline
+	idx_t child_start = meta_pipeline.GetChildren().size();
 	children[0].get().BuildPipelines(current, meta_pipeline);
+	vector<vector<shared_ptr<Pipeline>>> sink_work_bases(children.size());
+	sink_work_bases[0] = collect_sink_work(child_start);
 	bool can_saturate_threads =
 	    ContainsSink(children[0].get()) && children[0].get().CanSaturateThreads(current.GetClientContext());
 	for (idx_t i = 1; i < children.size(); i++) {
@@ -93,7 +106,35 @@ void PhysicalUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipelin
 		// Assign proper batch index to the union pipeline
 		meta_pipeline.AssignNextBatchIndex(union_pipeline);
 		// build the union pipeline
+		child_start = meta_pipeline.GetChildren().size();
 		children[i].get().BuildPipelines(union_pipeline, meta_pipeline);
+		sink_work_bases[i] = collect_sink_work(child_start);
+
+		// The sink work of this child must only start after the sink work of the children it depends
+		// on has fully completed (including its finalization) - e.g. when a child inserts data that is
+		// checked against data inserted by a previous child (foreign key constraints).
+		// We depend on the base pipeline of the dependency's sink work: its completion covers all
+		// pipelines of that meta pipeline and its finalization.
+		if (!sink_work_dependencies.empty()) {
+			for (auto &dep : sink_work_dependencies) {
+				if (dep.second != i) {
+					continue;
+				}
+				auto &dep_bases = sink_work_bases[dep.first];
+				if (dep_bases.empty()) {
+					continue;
+				}
+				for (idx_t k = child_start; k < meta_pipeline.GetChildren().size(); k++) {
+					vector<shared_ptr<Pipeline>> pipelines;
+					meta_pipeline.GetChildren()[k]->GetPipelines(pipelines, false);
+					for (auto &pipeline : pipelines) {
+						for (auto &dep_base : dep_bases) {
+							pipeline->AddDependency(dep_base);
+						}
+					}
+				}
+			}
+		}
 
 		if (last_child_ptr) {
 			// the pointer was set, set up the dependencies

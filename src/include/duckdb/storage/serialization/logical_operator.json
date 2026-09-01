@@ -574,6 +574,12 @@
         "name": "allow_out_of_order",
         "type": "bool",
         "default": "true"
+      },
+      {
+        "id": 204,
+        "name": "sink_work_dependencies",
+        "type": "vector<pair<idx_t, idx_t>>",
+        "default": "{}"
       }
     ],
     "constructor": [

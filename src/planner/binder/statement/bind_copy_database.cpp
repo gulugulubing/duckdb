@@ -18,6 +18,10 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/catalog/dependency_manager.hpp"
+#include "duckdb/parser/constraint.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -52,9 +56,37 @@ unique_ptr<LogicalOperator> Binder::BindCopyDatabaseData(Catalog &source_catalog
                                                          const Identifier &target_database_name) {
 	auto source_schemas = source_catalog.GetSchemas(context);
 
-	// We can just use ExtractEntries here because the order doesn't matter
 	ExportEntries entries;
 	PhysicalExport::ExtractEntries(context, source_schemas, entries);
+	// The data must be inserted in dependency order (e.g. foreign keys): referenced tables first
+	ReorderTableEntries(entries.tables);
+
+	// Collect foreign key dependencies between the tables: the insert of a table with foreign keys
+	// must only start after the insert of the referenced tables has fully completed
+	vector<pair<idx_t, idx_t>> sink_work_dependencies;
+	for (idx_t i = 0; i < entries.tables.size(); i++) {
+		auto &table = entries.tables[i].get().Cast<TableCatalogEntry>();
+		for (auto &constraint : table.GetConstraints()) {
+			if (constraint->type != ConstraintType::FOREIGN_KEY) {
+				continue;
+			}
+			auto &fk = constraint->Cast<ForeignKeyConstraint>();
+			if (fk.info.type != ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE) {
+				continue;
+			}
+			for (idx_t j = 0; j < entries.tables.size(); j++) {
+				auto &referenced = entries.tables[j].get().Cast<TableCatalogEntry>();
+				if (referenced.ParentSchema().name == fk.info.schema && referenced.name == fk.info.table) {
+					D_ASSERT(j < i);
+					sink_work_dependencies.emplace_back(j, i);
+					break;
+				}
+			}
+		}
+	}
+	std::sort(sink_work_dependencies.begin(), sink_work_dependencies.end());
+	sink_work_dependencies.erase(std::unique(sink_work_dependencies.begin(), sink_work_dependencies.end()),
+	                             sink_work_dependencies.end());
 
 	vector<unique_ptr<LogicalOperator>> insert_nodes;
 	for (auto &table_ref : entries.tables) {
@@ -98,6 +130,11 @@ unique_ptr<LogicalOperator> Binder::BindCopyDatabaseData(Catalog &source_catalog
 	} else {
 		// use UNION ALL to combine the individual copy statements into a single node
 		result = UnionOperators(std::move(insert_nodes));
+		if (result->type == LogicalOperatorType::LOGICAL_UNION) {
+			// A child's insert may check foreign keys against data inserted by a previous child,
+			// so the sink work of foreign-key dependent children is serialized via explicit dependencies
+			result->Cast<LogicalSetOperation>().sink_work_dependencies = std::move(sink_work_dependencies);
+		}
 	}
 	return result;
 }

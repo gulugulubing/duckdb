@@ -14,6 +14,7 @@
 #include "duckdb/common/enums/merge_action_type.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/catalog/catalog_entry_map.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
@@ -209,6 +210,9 @@ struct GlobalBinderState {
 	//! Bound expressions of parsed nodes, used to prevent re-binding of already bound parts
 	BoundExpressionMap bound_expressions;
 };
+
+//! Reorder the tables such that referenced tables (e.g. foreign key targets) come before referencing tables
+void ReorderTableEntries(catalog_entry_vector_t &tables);
 
 //! Bind the parsed query tree to the actual columns present in the catalog.
 /*!

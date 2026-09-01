@@ -31,6 +31,10 @@ public:
 	bool setop_all;
 	//! Whether or not UNION statements can be executed out of order
 	bool allow_out_of_order;
+	//! Pairs of child indices (dependency source, dependant): the sink work of the dependant child
+	//! (e.g. its INSERT) may only start after the sink work of the dependency source has fully completed.
+	//! Used by COPY FROM DATABASE to serialize foreign-key dependent inserts.
+	vector<pair<idx_t, idx_t>> sink_work_dependencies;
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override {

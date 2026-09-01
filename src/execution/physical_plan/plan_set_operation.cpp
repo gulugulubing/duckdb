@@ -53,7 +53,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalSetOperation &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_UNION:
 		// UNION
-		result = Make<PhysicalUnion>(op.types, std::move(children), op.estimated_cardinality, op.allow_out_of_order);
+		result = Make<PhysicalUnion>(op.types, std::move(children), op.estimated_cardinality, op.allow_out_of_order,
+		                             op.sink_work_dependencies);
 		break;
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT: {

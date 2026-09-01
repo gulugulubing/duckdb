@@ -2,8 +2,14 @@
 # description: Test COPY DATABASE with foreign key constraint
 # group: [copy_database]
 
-# FIXME - this is not working right now - we need to correctly take dependencies into account for COPY FROM DATABASE
-mode skip instable
+# the tables are created in an explicitly attached in-memory database: under storage test configs
+# (e.g. verify_compression) the test runs on a persistent database whose default catalog name
+# is the file name, so "memory" is not a valid source for COPY FROM DATABASE
+statement ok
+ATTACH ':memory:' AS src
+
+statement ok
+USE src
 
 statement ok
 CREATE TABLE pk_integers(i INTEGER PRIMARY KEY)
@@ -22,7 +28,7 @@ statement ok
 ATTACH ':memory:' AS db1
 
 statement ok
-COPY FROM DATABASE memory TO db1
+COPY FROM DATABASE src TO db1
 
 statement ok
 USE db1
@@ -66,3 +72,81 @@ DROP TABLE fk_integers;
 
 statement ok
 DROP TABLE pk_integers;
+
+# a chain of foreign keys forces transitive serialization of the inserts (chain_a -> chain_b -> chain_c),
+# while the table without foreign keys is not serialized against anything
+statement ok
+USE src
+
+statement ok
+CREATE TABLE chain_a(i INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE chain_b(j INTEGER PRIMARY KEY, FOREIGN KEY (j) REFERENCES chain_a(i))
+
+statement ok
+CREATE TABLE chain_c(k INTEGER, FOREIGN KEY (k) REFERENCES chain_b(j))
+
+statement ok
+CREATE TABLE no_fk(x INTEGER)
+
+statement ok
+INSERT INTO chain_a VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO chain_b VALUES (1), (2)
+
+statement ok
+INSERT INTO chain_c VALUES (1), (2)
+
+statement ok
+INSERT INTO no_fk VALUES (1), (2)
+
+statement ok
+ATTACH ':memory:' AS db2
+
+statement ok
+COPY FROM DATABASE src TO db2
+
+statement ok
+USE db2
+
+query I
+SELECT count(*) FROM chain_a
+----
+3
+
+query I
+SELECT count(*) FROM chain_b
+----
+2
+
+query I
+SELECT count(*) FROM chain_c
+----
+2
+
+query I
+SELECT count(*) FROM no_fk
+----
+2
+
+# the foreign keys are enforced in the copied database
+statement error
+INSERT INTO chain_b VALUES (4)
+----
+
+statement error
+INSERT INTO chain_c VALUES (3)
+----
+
+statement ok
+INSERT INTO chain_b VALUES (3)
+
+statement ok
+INSERT INTO chain_c VALUES (3)
+
+query I
+SELECT count(*) FROM chain_c
+----
+3
