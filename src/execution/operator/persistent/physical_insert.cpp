@@ -24,8 +24,56 @@
 #include "duckdb/storage/table/update_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
+#include "duckdb/planner/constraints/bound_foreign_key_constraint.hpp"
 
 namespace duckdb {
+
+bool HasAppendForeignKeyConstraints(const vector<unique_ptr<BoundConstraint>> &constraints) {
+	for (auto &constraint : constraints) {
+		if (constraint->type == ConstraintType::FOREIGN_KEY) {
+			auto &foreign_key = constraint->Cast<BoundForeignKeyConstraint>();
+			if (foreign_key.info.IsAppendConstraint()) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void BufferRowsForForeignKeyVerification(ClientContext &context, const vector<LogicalType> &insert_types,
+                                         const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                                         unique_ptr<ColumnDataCollection> &fk_chunks, DataChunk &insert_chunk) {
+	if (!HasAppendForeignKeyConstraints(bound_constraints)) {
+		return;
+	}
+	if (!fk_chunks) {
+		fk_chunks = make_uniq<ColumnDataCollection>(context, insert_types);
+	}
+	fk_chunks->Append(insert_chunk);
+}
+
+void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table,
+                               const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                               vector<unique_ptr<ColumnDataCollection>> &fk_chunks) {
+	if (fk_chunks.empty()) {
+		return;
+	}
+	auto &data_table = table.GetStorage();
+	auto &local_storage = LocalStorage::Get(context, data_table.db);
+	// the table has been appended to, so its transaction-local storage exists
+	auto storage = local_storage.GetStorage(data_table);
+	auto constraint_state = data_table.InitializeConstraintState(table, bound_constraints);
+	for (auto &fk_collection : fk_chunks) {
+		ColumnDataScanState scan_state;
+		fk_collection->InitializeScan(scan_state);
+		DataChunk chunk;
+		fk_collection->InitializeScanChunk(scan_state, chunk);
+		while (fk_collection->Scan(scan_state, chunk)) {
+			data_table.VerifyAppendForeignKeys(*constraint_state, context, chunk, storage);
+			chunk.Reset();
+		}
+	}
+}
 
 PhysicalInsert::PhysicalInsert(PhysicalPlan &physical_plan, vector<LogicalType> types_p, DuckTableEntry &table,
                                vector<unique_ptr<BoundConstraint>> bound_constraints_p,
@@ -612,6 +660,9 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 		if (return_chunk) {
 			gstate.return_collection.Append(insert_chunk);
 		}
+		// Buffer the rows for deferred foreign key verification (see VerifyDeferredForeignKeys)
+		BufferRowsForForeignKeyVerification(context.client, insert_types, bound_constraints, lstate.fk_chunks,
+		                                    insert_chunk);
 		// When action_type is throw, we already verify constraints in `OnConflictHandling`
 		storage.LocalAppend(table, context.client, insert_chunk, bound_constraints,
 		                    action_type == OnConflictAction::THROW);
@@ -643,6 +694,10 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 	OnConflictHandling(table, context, gstate, lstate, insert_chunk);
 	D_ASSERT(action_type != OnConflictAction::UPDATE);
 
+	// Buffer the rows for deferred foreign key verification (see VerifyDeferredForeignKeys)
+	BufferRowsForForeignKeyVerification(context.client, insert_types, bound_constraints, lstate.fk_chunks,
+	                                    insert_chunk);
+
 	auto &optimistic_collection = data_table.GetOptimisticCollection(context.client, lstate.collection_index);
 	auto &collection = *optimistic_collection.collection;
 	auto flushed_row_group_idx = collection.Append(insert_chunk, lstate.local_append_state);
@@ -658,6 +713,12 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	auto &client_profiler = QueryProfiler::Get(context.client);
 	context.thread.profiler.Flush(*this);
 	client_profiler.Flush(context.thread.profiler);
+
+	if (lstate.fk_chunks) {
+		// move the buffered chunks to the global state for deferred foreign key verification (see Finalize)
+		lock_guard<mutex> lock(gstate.lock);
+		gstate.fk_chunks.push_back(std::move(lstate.fk_chunks));
+	}
 
 	if (!parallel || !lstate.collection_index.IsValid()) {
 		return SinkCombineResultType::FINISHED;
@@ -765,11 +826,14 @@ private:
 SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                           OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<InsertGlobalState>();
-	if (gstate.unmerged_collections.empty()) {
-		return SinkFinalizeType::READY;
-	}
 	auto &table = gstate.table;
 	auto &data_table = table.GetStorage();
+	if (gstate.unmerged_collections.empty()) {
+		// all rows were appended directly during Sink (serial path): verify the foreign key constraints of the
+		// statement now that all of its rows are visible in the transaction-local storage
+		VerifyDeferredForeignKeys(context, table, bound_constraints, gstate.fk_chunks);
+		return SinkFinalizeType::READY;
+	}
 	const idx_t row_group_size = data_table.GetRowGroupSize();
 
 	if (gstate.insert_count < row_group_size) {
@@ -786,6 +850,8 @@ SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, Clie
 		}
 		data_table.FinalizeLocalAppend(append_state);
 		gstate.unmerged_collections.clear();
+		// all rows of the statement are now visible in the transaction-local storage - verify the foreign keys
+		VerifyDeferredForeignKeys(context, table, bound_constraints, gstate.fk_chunks);
 		return SinkFinalizeType::READY;
 	}
 
@@ -809,9 +875,27 @@ SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, Clie
 	}
 	gstate.unmerged_collections.clear();
 
-	// compact the merge sets in parallel through a new pipeline event
-	auto merge_event = make_shared_ptr<MergeCollectionsEvent>(pipeline, context, *this, table, std::move(mergers));
-	event.InsertEvent(std::move(merge_event));
+	if (HasAppendForeignKeyConstraints(bound_constraints)) {
+		// If the table has FK constraints, compact the merge sets synchronously: the deferred FK verification
+		// below requires all rows of the statement to be merged into the transaction-local storage, which a
+		// pending merge event would not guarantee.
+		auto &optimistic_writer = data_table.GetOptimisticWriter(context);
+		for (auto &merger : mergers) {
+			auto writer = make_uniq<OptimisticDataWriter>(context, data_table);
+			auto collection_index = merger->Flush(*writer);
+			auto &collection = data_table.GetOptimisticCollection(context, collection_index);
+			data_table.LocalMerge(context, table, collection);
+			data_table.ResetOptimisticCollection(context, collection_index);
+			optimistic_writer.Merge(*writer);
+		}
+		optimistic_writer.FinalFlush();
+		// all rows of the statement are now visible in the transaction-local storage - verify the foreign keys
+		VerifyDeferredForeignKeys(context, table, bound_constraints, gstate.fk_chunks);
+	} else {
+		// compact the merge sets in parallel through a new pipeline event
+		auto merge_event = make_shared_ptr<MergeCollectionsEvent>(pipeline, context, *this, table, std::move(mergers));
+		event.InsertEvent(std::move(merge_event));
+	}
 	return SinkFinalizeType::READY;
 }
 

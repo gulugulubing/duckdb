@@ -84,6 +84,8 @@ public:
 	idx_t next_start = 0;
 	atomic<bool> optimistically_written;
 	idx_t minimum_memory_per_thread;
+	//! Chunks buffered by the sink tasks, for deferred foreign key verification (see Finalize)
+	vector<unique_ptr<ColumnDataCollection>> fk_chunks;
 
 	bool ReadyToMerge(const idx_t count) const;
 	void ScheduleMergeTasks(ClientContext &context, const idx_t min_batch_index);
@@ -111,6 +113,8 @@ public:
 	PhysicalIndex collection_index;
 	unique_ptr<OptimisticDataWriter> optimistic_writer;
 	unique_ptr<ConstraintState> constraint_state;
+	//! Chunks buffered by this task, for deferred foreign key verification (see Finalize)
+	unique_ptr<ColumnDataCollection> fk_chunks;
 
 	void CreateNewCollection(ClientContext &context, DuckTableEntry &table_entry,
 	                         const vector<LogicalType> &insert_types) {
@@ -472,6 +476,10 @@ SinkResultType PhysicalBatchInsert::Sink(ExecutionContext &context, DataChunk &i
 	storage.VerifyAppendConstraints(*lstate.constraint_state, context.client, insert_chunk, local_table_storage,
 	                                nullptr);
 
+	// Buffer the chunk for deferred foreign key verification (see VerifyDeferredForeignKeys)
+	BufferRowsForForeignKeyVerification(context.client, insert_types, bound_constraints, lstate.fk_chunks,
+	                                    insert_chunk);
+
 	auto &optimistic_collection = table.GetStorage().GetOptimisticCollection(context.client, lstate.collection_index);
 	auto &collection = *optimistic_collection.collection;
 	auto flushed_row_group_idx = collection.Append(insert_chunk, lstate.current_append_state);
@@ -511,6 +519,11 @@ SinkCombineResultType PhysicalBatchInsert::Combine(ExecutionContext &context, Op
 		annotated_lock_guard<annotated_mutex> l(gstate.lock);
 		auto &optimistic_writer = gstate.table.GetStorage().GetOptimisticWriter(context.client);
 		optimistic_writer.Merge(*lstate.optimistic_writer);
+	}
+	if (lstate.fk_chunks) {
+		// move the buffered chunks to the global state for deferred foreign key verification (see Finalize)
+		annotated_lock_guard<annotated_mutex> fk_lock(gstate.lock);
+		gstate.fk_chunks.push_back(std::move(lstate.fk_chunks));
 	}
 
 	// unblock any blocked tasks
@@ -579,6 +592,8 @@ SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event,
 			data_table.ResetOptimisticCollection(context, collection_index);
 		}
 
+		// all rows of the statement are now merged into the transaction-local storage - verify the foreign keys
+		VerifyDeferredForeignKeys(context, g_state.table, bound_constraints, g_state.fk_chunks);
 		auto &optimistic_writer = data_table.GetOptimisticWriter(context);
 		optimistic_writer.Merge(*writer);
 		optimistic_writer.FinalFlush();
@@ -605,6 +620,8 @@ SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event,
 		data_table.ResetOptimisticCollection(context, entry.collection_index);
 	}
 
+	// all rows of the statement are now appended to the transaction-local storage - verify the foreign keys
+	VerifyDeferredForeignKeys(context, g_state.table, bound_constraints, g_state.fk_chunks);
 	g_state.collections.clear();
 	data_table.FinalizeLocalAppend(append_state);
 	memory_manager.FinalCheck();

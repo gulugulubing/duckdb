@@ -844,14 +844,29 @@ void DataTable::VerifyAppendConstraints(ConstraintState &constraint_state, Clien
 			break;
 		}
 		case ConstraintType::FOREIGN_KEY: {
-			auto &bound_foreign_key = constraint->Cast<BoundForeignKeyConstraint>();
-			if (bound_foreign_key.info.IsAppendConstraint()) {
-				VerifyAppendForeignKeyConstraint(storage, bound_foreign_key, context, chunk);
-			}
+			// Foreign key constraints are deliberately not verified here: they are verified after all rows of the
+			// statement have been appended and are visible in the transaction-local storage, since rows may
+			// reference other rows appended by the same statement. See VerifyAppendForeignKeys.
 			break;
 		}
 		default:
 			throw InternalException("invalid constraint type");
+		}
+	}
+}
+
+void DataTable::VerifyAppendForeignKeys(ConstraintState &constraint_state, ClientContext &context, DataChunk &chunk,
+                                        optional_ptr<LocalTableStorage> storage) {
+	auto &constraints = constraint_state.table.GetConstraints();
+	for (idx_t i = 0; i < constraint_state.bound_constraints.size(); i++) {
+		auto &base_constraint = constraints[i];
+		auto &constraint = constraint_state.bound_constraints[i];
+		if (base_constraint->type != ConstraintType::FOREIGN_KEY) {
+			continue;
+		}
+		auto &bound_foreign_key = constraint->Cast<BoundForeignKeyConstraint>();
+		if (bound_foreign_key.info.IsAppendConstraint()) {
+			VerifyAppendForeignKeyConstraint(storage, bound_foreign_key, context, chunk);
 		}
 	}
 }
@@ -981,6 +996,14 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataC
 	storage.InitializeLocalAppend(append_state, table, context, bound_constraints);
 	append_state.storage->AppendToDeleteIndexes(row_ids, delete_chunk);
 
+	// Verify the foreign key constraints of the (re-)inserted rows here: this path is used by UPDATE statements
+	// that are rewritten into DELETE + INSERT (and by the equivalent ON CONFLICT DO UPDATE path). It appends
+	// directly through the storage layer rather than through an insert sink, so it does not participate in the
+	// deferred foreign key verification of the insert operators (see VerifyAppendForeignKeys). The verification
+	// below runs after the delete ART is registered, matching the eager semantics of the (previously inlined)
+	// foreign key checks.
+	VerifyAppendForeignKeys(*append_state.constraint_state, context, chunk, append_state.storage);
+
 	storage.LocalAppend(append_state, table, context, chunk, false);
 	storage.FinalizeLocalAppend(append_state);
 }
@@ -995,6 +1018,10 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, Colum
 	if (!column_ids || column_ids->empty()) {
 		for (auto &chunk : collection.Chunks()) {
 			storage.LocalAppend(append_state, table, context, chunk, false);
+			// This helper appends directly through the storage layer, bypassing the insert sinks that defer
+			// FK verification to the end of the statement, so verify per chunk here - after the append, so the
+			// rows of this chunk are visible.
+			VerifyAppendForeignKeys(*append_state.constraint_state, context, chunk, append_state.storage);
 		}
 		storage.FinalizeLocalAppend(append_state);
 		return;
@@ -1038,6 +1065,10 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, Colum
 	for (auto &chunk : collection.Chunks()) {
 		expression_executor.Execute(chunk, result);
 		storage.LocalAppend(append_state, table, context, result, false);
+		// This helper appends directly through the storage layer, bypassing the insert sinks that defer
+		// FK verification to the end of the statement, so verify per chunk here - after the append, so the
+		// rows of this chunk are visible.
+		VerifyAppendForeignKeys(*append_state.constraint_state, context, result, append_state.storage);
 		result.Reset();
 	}
 	storage.FinalizeLocalAppend(append_state);

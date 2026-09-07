@@ -259,6 +259,13 @@ public:
 	//! Verify constraints with a chunk from the Append containing all columns of the table
 	void VerifyAppendConstraints(ConstraintState &constraint_state, ClientContext &context, DataChunk &chunk,
 	                             optional_ptr<LocalTableStorage> local_storage, optional_ptr<ConflictManager> manager);
+	//! Verify the foreign key constraints of a chunk that was appended by the current statement.
+	//! FK constraints are not verified eagerly per chunk (see VerifyAppendConstraints), because a row may reference
+	//! other rows appended by the same statement, which are only visible after they are appended to the
+	//! transaction-local storage. Instead, the rows of a statement are buffered while they are sunk, and verified
+	//! with this function once all appends of the statement are visible - see PhysicalBatchInsert::Finalize.
+	void VerifyAppendForeignKeys(ConstraintState &constraint_state, ClientContext &context, DataChunk &chunk,
+	                             optional_ptr<LocalTableStorage> storage);
 
 	shared_ptr<DataTableInfo> &GetDataTableInfo();
 

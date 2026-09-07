@@ -23,6 +23,26 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
+// Foreign key verification helpers (shared between PhysicalInsert and PhysicalBatchInsert)
+//===--------------------------------------------------------------------===//
+
+//! Returns true if any of the bound constraints is a foreign key constraint that is verified on append
+bool HasAppendForeignKeyConstraints(const vector<unique_ptr<BoundConstraint>> &constraints);
+//! Buffers the rows of a chunk for deferred foreign key verification (see VerifyDeferredForeignKeys). The chunk
+//! must contain the rows that will actually be appended (i.e. after ON CONFLICT conflict resolution).
+void BufferRowsForForeignKeyVerification(ClientContext &context, const vector<LogicalType> &insert_types,
+                                         const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                                         unique_ptr<ColumnDataCollection> &fk_chunks, DataChunk &insert_chunk);
+//! Verifies the foreign key constraints of the rows appended by an insert sink. FK constraints are not verified
+//! eagerly per chunk (see DataTable::VerifyAppendConstraints), because a row may reference other rows appended by
+//! the same statement, which are only visible once they are appended to the transaction-local storage. The rows of
+//! a statement are buffered while sinking (see BufferRowsForForeignKeyVerification) and verified with this function
+//! once all appends of the statement are visible.
+void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table,
+                               const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                               vector<unique_ptr<ColumnDataCollection>> &fk_chunks);
+
+//===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
 class InsertGlobalState : public GlobalSinkState {
@@ -36,6 +56,8 @@ public:
 	ColumnDataCollection return_collection;
 	//! Leftover thread-local collections (smaller than a row group) that are compacted and merged in Finalize.
 	vector<PhysicalIndex> unmerged_collections;
+	//! Chunks buffered by the sink tasks, for deferred foreign key verification (see PhysicalInsert::Finalize)
+	vector<unique_ptr<ColumnDataCollection>> fk_chunks;
 };
 
 class InsertLocalState : public LocalSinkState {
@@ -59,6 +81,8 @@ public:
 	unique_ptr<RowIdDeduplicator> updated_rows;
 	idx_t update_count = 0;
 	unique_ptr<ConstraintState> constraint_state;
+	//! Chunks buffered by this task, for deferred foreign key verification (see PhysicalInsert::Finalize)
+	unique_ptr<ColumnDataCollection> fk_chunks;
 	const vector<unique_ptr<BoundConstraint>> &bound_constraints;
 	//! The delete state for ON CONFLICT handling that is rewritten into DELETE + INSERT.
 	unique_ptr<TableDeleteState> delete_state;
