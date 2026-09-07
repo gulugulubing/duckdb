@@ -812,6 +812,12 @@ public:
 			optimistic_writer.Merge(*writers[i]);
 		}
 		optimistic_writer.FinalFlush();
+
+		// Deferred foreign key verification: all rows of the statement are now merged into the transaction-local
+		// storage, so rows may reference rows inserted by the same statement. No-op if the table has no foreign
+		// key constraints (no rows were buffered).
+		auto &gstate = op.sink_state->Cast<InsertGlobalState>();
+		VerifyDeferredForeignKeys(context, table, op.bound_constraints, gstate.fk_chunks);
 	}
 
 private:
@@ -875,27 +881,11 @@ SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, Clie
 	}
 	gstate.unmerged_collections.clear();
 
-	if (HasAppendForeignKeyConstraints(bound_constraints)) {
-		// If the table has FK constraints, compact the merge sets synchronously: the deferred FK verification
-		// below requires all rows of the statement to be merged into the transaction-local storage, which a
-		// pending merge event would not guarantee.
-		auto &optimistic_writer = data_table.GetOptimisticWriter(context);
-		for (auto &merger : mergers) {
-			auto writer = make_uniq<OptimisticDataWriter>(context, data_table);
-			auto collection_index = merger->Flush(*writer);
-			auto &collection = data_table.GetOptimisticCollection(context, collection_index);
-			data_table.LocalMerge(context, table, collection);
-			data_table.ResetOptimisticCollection(context, collection_index);
-			optimistic_writer.Merge(*writer);
-		}
-		optimistic_writer.FinalFlush();
-		// all rows of the statement are now visible in the transaction-local storage - verify the foreign keys
-		VerifyDeferredForeignKeys(context, table, bound_constraints, gstate.fk_chunks);
-	} else {
-		// compact the merge sets in parallel through a new pipeline event
-		auto merge_event = make_shared_ptr<MergeCollectionsEvent>(pipeline, context, *this, table, std::move(mergers));
-		event.InsertEvent(std::move(merge_event));
-	}
+	// compact the merge sets in parallel through a new pipeline event. If the table has foreign key constraints,
+	// the deferred FK verification runs in the event's FinishEvent, after all rows of the statement are merged
+	// into the transaction-local storage.
+	auto merge_event = make_shared_ptr<MergeCollectionsEvent>(pipeline, context, *this, table, std::move(mergers));
+	event.InsertEvent(std::move(merge_event));
 	return SinkFinalizeType::READY;
 }
 
