@@ -845,8 +845,8 @@ void DataTable::VerifyAppendConstraints(ConstraintState &constraint_state, Clien
 		}
 		case ConstraintType::FOREIGN_KEY: {
 			// Foreign key constraints are deliberately not verified here: they are verified after all rows of the
-			// statement have been appended and are visible in the transaction-local storage, since rows may
-			// reference other rows appended by the same statement. See VerifyAppendForeignKeys.
+			// statement have been appended (see VerifyAppendForeignKeys). Append paths that bypass the insert
+			// sinks (the storage-level LocalAppend overloads) verify the foreign keys themselves.
 			break;
 		}
 		default:
@@ -1018,9 +1018,7 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, Colum
 	if (!column_ids || column_ids->empty()) {
 		for (auto &chunk : collection.Chunks()) {
 			storage.LocalAppend(append_state, table, context, chunk, false);
-			// This helper appends directly through the storage layer, bypassing the insert sinks that defer
-			// FK verification to the end of the statement, so verify per chunk here - after the append, so the
-			// rows of this chunk are visible.
+			// bypasses the insert sinks - verify per chunk, after the append (rows of this chunk are visible)
 			VerifyAppendForeignKeys(*append_state.constraint_state, context, chunk, append_state.storage);
 		}
 		storage.FinalizeLocalAppend(append_state);
@@ -1065,9 +1063,7 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, Colum
 	for (auto &chunk : collection.Chunks()) {
 		expression_executor.Execute(chunk, result);
 		storage.LocalAppend(append_state, table, context, result, false);
-		// This helper appends directly through the storage layer, bypassing the insert sinks that defer
-		// FK verification to the end of the statement, so verify per chunk here - after the append, so the
-		// rows of this chunk are visible.
+		// bypasses the insert sinks - verify per chunk, after the append (rows of this chunk are visible)
 		VerifyAppendForeignKeys(*append_state.constraint_state, context, result, append_state.storage);
 		result.Reset();
 	}

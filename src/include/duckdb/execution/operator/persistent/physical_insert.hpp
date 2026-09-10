@@ -28,17 +28,22 @@ namespace duckdb {
 
 //! Returns true if any of the bound constraints is a foreign key constraint that is verified on append
 bool HasAppendForeignKeyConstraints(const vector<unique_ptr<BoundConstraint>> &constraints);
-//! Buffers the rows of a chunk for deferred foreign key verification (see VerifyDeferredForeignKeys). The chunk
-//! must contain the rows that will actually be appended (i.e. after ON CONFLICT conflict resolution).
+//! The physical column positions (within a full table chunk) of the columns that participate in any of the append
+//! foreign key constraints, deduplicated and sorted
+vector<idx_t> GetAppendForeignKeyKeyPositions(const vector<unique_ptr<BoundConstraint>> &constraints);
+//! Buffers only the foreign key columns of a chunk for deferred foreign key verification (see
+//! VerifyDeferredForeignKeys), instead of the full rows. The chunk must contain the rows that will actually be
+//! appended (i.e. after ON CONFLICT conflict resolution). `insert_types` are the full table types.
 void BufferRowsForForeignKeyVerification(ClientContext &context, const vector<LogicalType> &insert_types,
                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints,
                                          unique_ptr<ColumnDataCollection> &fk_chunks, DataChunk &insert_chunk);
 //! Verifies the foreign key constraints of the rows appended by an insert sink. FK constraints are not verified
 //! eagerly per chunk (see DataTable::VerifyAppendConstraints), because a row may reference other rows appended by
-//! the same statement, which are only visible once they are appended to the transaction-local storage. The rows of
-//! a statement are buffered while sinking (see BufferRowsForForeignKeyVerification) and verified with this function
-//! once all appends of the statement are visible.
-void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table,
+//! the same statement, which are only visible once they are appended to the transaction-local storage. Only the
+//! foreign key columns of the statement's rows are buffered while sinking (see
+//! BufferRowsForForeignKeyVerification) and verified with this function once all appends are visible.
+//! `insert_types` are the full table types (used to reconstruct table-width chunks for the verification).
+void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table, const vector<LogicalType> &insert_types,
                                const vector<unique_ptr<BoundConstraint>> &bound_constraints,
                                vector<unique_ptr<ColumnDataCollection>> &fk_chunks);
 

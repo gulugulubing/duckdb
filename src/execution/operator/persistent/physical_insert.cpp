@@ -28,34 +28,56 @@
 
 namespace duckdb {
 
-bool HasAppendForeignKeyConstraints(const vector<unique_ptr<BoundConstraint>> &constraints) {
+vector<idx_t> GetAppendForeignKeyKeyPositions(const vector<unique_ptr<BoundConstraint>> &constraints) {
+	vector<idx_t> positions;
 	for (auto &constraint : constraints) {
-		if (constraint->type == ConstraintType::FOREIGN_KEY) {
-			auto &foreign_key = constraint->Cast<BoundForeignKeyConstraint>();
-			if (foreign_key.info.IsAppendConstraint()) {
-				return true;
-			}
+		if (constraint->type != ConstraintType::FOREIGN_KEY) {
+			continue;
+		}
+		auto &foreign_key = constraint->Cast<BoundForeignKeyConstraint>();
+		if (!foreign_key.info.IsAppendConstraint()) {
+			continue;
+		}
+		for (auto &key : foreign_key.info.fk_keys) {
+			positions.push_back(key.index);
 		}
 	}
-	return false;
+	std::sort(positions.begin(), positions.end());
+	positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+	return positions;
 }
 
 void BufferRowsForForeignKeyVerification(ClientContext &context, const vector<LogicalType> &insert_types,
                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints,
                                          unique_ptr<ColumnDataCollection> &fk_chunks, DataChunk &insert_chunk) {
-	if (!HasAppendForeignKeyConstraints(bound_constraints)) {
+	auto key_positions = GetAppendForeignKeyKeyPositions(bound_constraints);
+	if (key_positions.empty()) {
 		return;
 	}
 	if (!fk_chunks) {
-		fk_chunks = make_uniq<ColumnDataCollection>(context, insert_types);
+		vector<LogicalType> key_types;
+		key_types.reserve(key_positions.size());
+		for (auto pos : key_positions) {
+			key_types.push_back(insert_types[pos]);
+		}
+		fk_chunks = make_uniq<ColumnDataCollection>(context, std::move(key_types));
 	}
-	fk_chunks->Append(insert_chunk);
+	DataChunk key_chunk;
+	key_chunk.InitializeEmpty(fk_chunks->Types());
+	// the referenced columns are flat: both insert sinks flatten the chunk on entry, and conflict handling
+	// materializes the surviving rows
+	for (idx_t i = 0; i < key_positions.size(); i++) {
+		key_chunk.data[i].Reference(insert_chunk.data[key_positions[i]]);
+	}
+	key_chunk.SetChildCardinality(insert_chunk.size());
+	fk_chunks->Append(key_chunk);
 }
 
-void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table,
+void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table, const vector<LogicalType> &insert_types,
                                const vector<unique_ptr<BoundConstraint>> &bound_constraints,
                                vector<unique_ptr<ColumnDataCollection>> &fk_chunks) {
-	if (fk_chunks.empty()) {
+	auto key_positions = GetAppendForeignKeyKeyPositions(bound_constraints);
+	if (fk_chunks.empty() || key_positions.empty()) {
 		return;
 	}
 	auto &data_table = table.GetStorage();
@@ -63,14 +85,23 @@ void VerifyDeferredForeignKeys(ClientContext &context, DuckTableEntry &table,
 	// the table has been appended to, so its transaction-local storage exists
 	auto storage = local_storage.GetStorage(data_table);
 	auto constraint_state = data_table.InitializeConstraintState(table, bound_constraints);
+	// Reconstruct a table-width chunk that only references the buffered foreign key columns; the remaining
+	// columns are left empty, as the FK verification only reads the key columns.
+	DataChunk shell;
+	shell.InitializeEmpty(insert_types);
 	for (auto &fk_collection : fk_chunks) {
 		ColumnDataScanState scan_state;
 		fk_collection->InitializeScan(scan_state);
-		DataChunk chunk;
-		fk_collection->InitializeScanChunk(scan_state, chunk);
-		while (fk_collection->Scan(scan_state, chunk)) {
-			data_table.VerifyAppendForeignKeys(*constraint_state, context, chunk, storage);
-			chunk.Reset();
+		DataChunk key_chunk;
+		fk_collection->InitializeScanChunk(scan_state, key_chunk);
+		while (fk_collection->Scan(scan_state, key_chunk)) {
+			for (idx_t i = 0; i < key_positions.size(); i++) {
+				shell.data[key_positions[i]].Reference(key_chunk.data[i]);
+			}
+			shell.SetChildCardinality(key_chunk.size());
+			data_table.VerifyAppendForeignKeys(*constraint_state, context, shell, storage);
+			shell.Reset();
+			key_chunk.Reset();
 		}
 	}
 }
@@ -817,7 +848,7 @@ public:
 		// storage, so rows may reference rows inserted by the same statement. No-op if the table has no foreign
 		// key constraints (no rows were buffered).
 		auto &gstate = op.sink_state->Cast<InsertGlobalState>();
-		VerifyDeferredForeignKeys(context, table, op.bound_constraints, gstate.fk_chunks);
+		VerifyDeferredForeignKeys(context, table, op.insert_types, op.bound_constraints, gstate.fk_chunks);
 	}
 
 private:
@@ -837,7 +868,7 @@ SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, Clie
 	if (gstate.unmerged_collections.empty()) {
 		// all rows were appended directly during Sink (serial path): verify the foreign key constraints of the
 		// statement now that all of its rows are visible in the transaction-local storage
-		VerifyDeferredForeignKeys(context, table, bound_constraints, gstate.fk_chunks);
+		VerifyDeferredForeignKeys(context, table, insert_types, bound_constraints, gstate.fk_chunks);
 		return SinkFinalizeType::READY;
 	}
 	const idx_t row_group_size = data_table.GetRowGroupSize();
@@ -857,7 +888,7 @@ SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, Clie
 		data_table.FinalizeLocalAppend(append_state);
 		gstate.unmerged_collections.clear();
 		// all rows of the statement are now visible in the transaction-local storage - verify the foreign keys
-		VerifyDeferredForeignKeys(context, table, bound_constraints, gstate.fk_chunks);
+		VerifyDeferredForeignKeys(context, table, insert_types, bound_constraints, gstate.fk_chunks);
 		return SinkFinalizeType::READY;
 	}
 

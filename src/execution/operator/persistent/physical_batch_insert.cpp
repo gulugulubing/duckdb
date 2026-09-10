@@ -593,7 +593,7 @@ SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event,
 		}
 
 		// all rows of the statement are now merged into the transaction-local storage - verify the foreign keys
-		VerifyDeferredForeignKeys(context, g_state.table, bound_constraints, g_state.fk_chunks);
+		VerifyDeferredForeignKeys(context, g_state.table, insert_types, bound_constraints, g_state.fk_chunks);
 		auto &optimistic_writer = data_table.GetOptimisticWriter(context);
 		optimistic_writer.Merge(*writer);
 		optimistic_writer.FinalFlush();
@@ -621,7 +621,7 @@ SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event,
 	}
 
 	// all rows of the statement are now appended to the transaction-local storage - verify the foreign keys
-	VerifyDeferredForeignKeys(context, g_state.table, bound_constraints, g_state.fk_chunks);
+	VerifyDeferredForeignKeys(context, g_state.table, insert_types, bound_constraints, g_state.fk_chunks);
 	g_state.collections.clear();
 	data_table.FinalizeLocalAppend(append_state);
 	memory_manager.FinalCheck();
