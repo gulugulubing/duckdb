@@ -26,8 +26,6 @@ namespace duckdb {
 // Foreign key verification helpers (shared between PhysicalInsert and PhysicalBatchInsert)
 //===--------------------------------------------------------------------===//
 
-//! Returns true if any of the bound constraints is a foreign key constraint that is verified on append
-bool HasAppendForeignKeyConstraints(const vector<unique_ptr<BoundConstraint>> &constraints);
 //! The physical column positions (within a full table chunk) of the columns that participate in any of the append
 //! foreign key constraints, deduplicated and sorted
 vector<idx_t> GetAppendForeignKeyKeyPositions(const vector<unique_ptr<BoundConstraint>> &constraints);
